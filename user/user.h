@@ -40,3 +40,5 @@ void free(void*);
 int atoi(const char*);
 int memcmp(const void *, const void *, uint);
 void *memcpy(void *, const void *, uint);
+
+#define NELEM(x) (sizeof(x) / sizeof((x)[0]))

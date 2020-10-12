@@ -149,6 +149,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->mask = 0;
   p->state = UNUSED;
 }
 
@@ -293,6 +294,7 @@ fork(void)
 
   pid = np->pid;
 
+  np->mask = p->mask;
   np->state = RUNNABLE;
 
   release(&np->lock);
@@ -692,4 +694,17 @@ procdump(void)
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
   }
+}
+
+uint64
+proc_unused(void)
+{
+  uint64 nproc = 0;
+
+  for (struct proc *p = proc; p < &proc[NPROC]; p++) {
+    if (p->state != UNUSED) {
+      nproc++;
+    }
+  }
+  return nproc;
 }

@@ -272,7 +272,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 // Recursively free page-table pages.
 // All leaf mappings must already have been removed.
 void
-freewalk(pagetable_t pagetable)
+freewalk(pagetable_t pagetable, int ignore_leaf)
 {
   // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
@@ -280,9 +280,9 @@ freewalk(pagetable_t pagetable)
     if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
       // this PTE points to a lower-level page table.
       uint64 child = PTE2PA(pte);
-      freewalk((pagetable_t)child);
+      freewalk((pagetable_t) child, ignore_leaf);
       pagetable[i] = 0;
-    } else if(pte & PTE_V){
+    } else if (pte & PTE_V && !ignore_leaf) {
       panic("freewalk: leaf");
     }
   }
@@ -296,7 +296,7 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 {
   if(sz > 0)
     uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
-  freewalk(pagetable);
+  freewalk(pagetable, 0);
 }
 
 // Given a parent process's page table, copy
@@ -459,4 +459,28 @@ vmprint(pagetable_t pagetable, int level)
       vmprint((pagetable_t) PTE2PA(pagetable[i]), level + 1);
     }
   }
+}
+
+int
+copy_pagetable(pagetable_t old, pagetable_t new)
+{
+  for (int i = 0; i < 512; i++) {
+    if ((old[i] & PTE_V) == 0) {
+      continue;
+    }
+    if ((old[i] & (PTE_X | PTE_W | PTE_R)) == 0) {
+      pagetable_t table = kalloc();
+      if (table == 0) {
+        return -1;
+      }
+      memset(table, 0, PGSIZE);
+      new[i] = PA2PTE(table) | PTE_V;
+      if (copy_pagetable((pagetable_t) PTE2PA(old[i]), table) < 0) {
+        return -1;
+      }
+    } else {
+      new[i] = old[i];
+    }
+  }
+  return 0;
 }

@@ -121,6 +121,13 @@ found:
     return 0;
   }
 
+  p->kpagetable = proc_kpagetable();
+  if (p->kpagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Set up new context to start executing at forkret,
   // which returns to user space.
   memset(&p->context, 0, sizeof(p->context));
@@ -142,6 +149,10 @@ freeproc(struct proc *p)
   if(p->pagetable)
     proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if (p->kpagetable) {
+    freewalk(p->kpagetable, 1);
+    p->kpagetable = 0;
+  }
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -182,6 +193,29 @@ proc_pagetable(struct proc *p)
     return 0;
   }
 
+  return pagetable;
+}
+
+pagetable_t
+proc_kpagetable(void)
+{
+  pagetable_t pagetable;
+
+  pagetable = kalloc();
+  if (pagetable == 0) {
+    return 0;
+  }
+  memset(pagetable, 0, PGSIZE);
+
+  extern pagetable_t kernel_pagetable;
+  if (copy_pagetable(kernel_pagetable, pagetable) < 0) {
+    freewalk(pagetable, 1);
+    return 0;
+  }
+
+  // This part will not be used after booting, unmap it to make
+  // more room for user program.
+  uvmunmap(pagetable, CLINT, 0x10000 / PGSIZE, 0);
   return pagetable;
 }
 
@@ -334,6 +368,10 @@ exit(int status)
 {
   struct proc *p = myproc();
 
+  // Switch to kernel pagetable as the current proc
+  // can be freed at any time.
+  kvminithart();
+
   if(p == initproc)
     panic("init exiting");
 
@@ -473,7 +511,11 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+
+        w_satp(MAKE_SATP(p->kpagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
+        kvminithart();
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.

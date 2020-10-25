@@ -18,8 +18,9 @@ exec(char *path, char **argv)
   struct elfhdr elf;
   struct inode *ip;
   struct proghdr ph;
-  pagetable_t pagetable = 0, oldpagetable;
+  pagetable_t pagetable = 0, kpagetable = 0, oldpagetable;
   struct proc *p = myproc();
+  uint64 oldsz = p->sz;
 
   begin_op();
 
@@ -37,6 +38,17 @@ exec(char *path, char **argv)
 
   if((pagetable = proc_pagetable(p)) == 0)
     goto bad;
+  if ((kpagetable = proc_kpagetable()) == 0) {
+    goto bad;
+  }
+
+  oldpagetable = p->kpagetable;
+  // Change to kpagetable must be made here, since further
+  // file operations may cause the process to sleep, which in turn
+  // triggers the reloading of p->kpagetable at scheduler.
+  p->kpagetable = kpagetable;
+  w_satp(MAKE_SATP(kpagetable));
+  sfence_vma();
 
   // Load program into memory.
   for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
@@ -49,31 +61,31 @@ exec(char *path, char **argv)
     if(ph.vaddr + ph.memsz < ph.vaddr)
       goto bad;
     uint64 sz1;
-    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
+    if((sz1 = uvmalloc(pagetable, kpagetable, sz, ph.vaddr + ph.memsz)) == 0)
       goto bad;
     sz = sz1;
     if(ph.vaddr % PGSIZE != 0)
       goto bad;
-    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+    if(loadseg(kpagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
       goto bad;
   }
   iunlockput(ip);
   end_op();
   ip = 0;
 
-  p = myproc();
-  uint64 oldsz = p->sz;
-
   // Allocate two pages at the next page boundary.
   // Use the second as the user stack.
   sz = PGROUNDUP(sz);
   uint64 sz1;
-  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE)) == 0)
+  if((sz1 = uvmalloc(pagetable, kpagetable, sz, sz + 2*PGSIZE)) == 0)
     goto bad;
   sz = sz1;
   uvmclear(pagetable, sz-2*PGSIZE);
   sp = sz;
   stackbase = sp - PGSIZE;
+
+  // Update p->sz for copyout.
+  p->sz = sz;
 
   // Push argument strings, prepare rest of stack in ustack.
   for(argc = 0; argv[argc]; argc++) {
@@ -107,11 +119,14 @@ exec(char *path, char **argv)
     if(*s == '/')
       last = s+1;
   safestrcpy(p->name, last, sizeof(p->name));
-    
+
+  // Free old per-process kernel pagetable.
+  freewalk(oldpagetable, 1);
+
   // Commit to the user image.
   oldpagetable = p->pagetable;
   p->pagetable = pagetable;
-  p->sz = sz;
+  // p->sz = sz;
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp; // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
@@ -122,9 +137,16 @@ exec(char *path, char **argv)
 
   return argc; // this ends up in a0, the first argument to main(argc, argv)
 
- bad:
+bad:
+  p->sz = oldsz;
   if(pagetable)
     proc_freepagetable(pagetable, sz);
+  if (kpagetable) {
+    p->kpagetable = oldpagetable;
+    w_satp(MAKE_SATP(oldpagetable));
+    sfence_vma();
+    freewalk(kpagetable, 1);
+  }
   if(ip){
     iunlockput(ip);
     end_op();
@@ -140,22 +162,22 @@ static int
 loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
 {
   uint i, n;
-  uint64 pa;
+
+  if (r_satp() != MAKE_SATP(pagetable)) {
+    panic("loadseg: using wrong pagetable");
+  }
 
   if((va % PGSIZE) != 0)
     panic("loadseg: va must be page aligned");
 
   for(i = 0; i < sz; i += PGSIZE){
-    pa = walkaddr(pagetable, va + i);
-    if(pa == 0)
-      panic("loadseg: address should exist");
     if(sz - i < PGSIZE)
       n = sz - i;
     else
       n = PGSIZE;
-    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+    if(readi(ip, 0, (uint64) (va + i), offset+i, n) != n)
       return -1;
   }
-  
+
   return 0;
 }

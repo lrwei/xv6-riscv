@@ -211,7 +211,7 @@ uvmcreate()
 // for the very first process.
 // sz must be less than a page.
 void
-uvminit(pagetable_t pagetable, uchar *src, uint sz)
+uvminit(pagetable_t pagetable, pagetable_t kpagetable, uchar *src, uint sz)
 {
   char *mem;
 
@@ -220,13 +220,15 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
   mem = kalloc();
   memset(mem, 0, PGSIZE);
   mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
+  mappages(kpagetable, 0, PGSIZE, (uint64)mem, PTE_W | PTE_R);
   memmove(mem, src, sz);
 }
 
 // Allocate PTEs and physical memory to grow process from oldsz to
 // newsz, which need not be page aligned.  Returns new size or 0 on error.
 uint64
-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmalloc(pagetable_t pagetable, pagetable_t kpagetable, uint64 oldsz,
+         uint64 newsz)
 {
   char *mem;
   uint64 a;
@@ -238,17 +240,23 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   for(a = oldsz; a < newsz; a += PGSIZE){
     mem = kalloc();
     if(mem == 0){
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
+      goto err;
     }
     memset(mem, 0, PGSIZE);
     if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
       kfree(mem);
-      uvmdealloc(pagetable, a, oldsz);
-      return 0;
+      goto err;
+    }
+    if (mappages(kpagetable, a, PGSIZE, (uint64) mem, PTE_W | PTE_R) < 0) {
+      uvmunmap(pagetable, a, 1, 1);
+      goto err;
     }
   }
   return newsz;
+
+err:
+  uvmdealloc(pagetable, kpagetable, a, oldsz);
+  return 0;
 }
 
 // Deallocate user pages to bring the process size from oldsz to
@@ -256,7 +264,8 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 // need to be less than oldsz.  oldsz can be larger than the actual
 // process size.  Returns the new process size.
 uint64
-uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+uvmdealloc(pagetable_t pagetable, pagetable_t kpagetable, uint64 oldsz,
+           uint64 newsz)
 {
   if(newsz >= oldsz)
     return oldsz;
@@ -264,6 +273,7 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
   if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
     int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
     uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+    uvmunmap(kpagetable, PGROUNDUP(newsz), npages, 0);
   }
 
   return newsz;
@@ -274,6 +284,10 @@ uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
 void
 freewalk(pagetable_t pagetable, int ignore_leaf)
 {
+  if (r_satp() == MAKE_SATP(pagetable)) {
+    panic("freewalk: freeing current pagetable");
+  }
+
   // there are 2^9 = 512 PTEs in a page table.
   for(int i = 0; i < 512; i++){
     pte_t pte = pagetable[i];
@@ -306,15 +320,15 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
 int
-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+uvmcopy(pagetable_t old, pagetable_t new, pagetable_t knew, uint64 sz)
 {
   pte_t *pte;
-  uint64 pa, i;
+  uint64 pa, va;
   uint flags;
   char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for(va = 0; va < sz; va += PGSIZE){
+    if((pte = walk(old, va, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
@@ -323,15 +337,20 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
     if((mem = kalloc()) == 0)
       goto err;
     memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+    if(mappages(new, va, PGSIZE, (uint64)mem, flags) != 0){
       kfree(mem);
+      goto err;
+    }
+    flags &= ~(PTE_U | PTE_X);
+    if (mappages(knew, va, PGSIZE, (uint64) mem, flags) < 0) {
+      uvmunmap(new, va, 1, 1);
       goto err;
     }
   }
   return 0;
 
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
+err:
+  uvmdealloc(new, knew, va, 0);
   return -1;
 }
 
@@ -354,6 +373,7 @@ uvmclear(pagetable_t pagetable, uint64 va)
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
+  return copyout_new(pagetable, dstva, src, len);
   uint64 n, va0, pa0;
 
   while(len > 0){
@@ -379,6 +399,7 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 int
 copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 {
+  return copyin_new(pagetable, dst, srcva, len);
   uint64 n, va0, pa0;
 
   while(len > 0){
@@ -405,6 +426,7 @@ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
 int
 copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
 {
+  return copyinstr_new(pagetable, dst, srcva, max);
   uint64 n, va0, pa0;
   int got_null = 0;
 

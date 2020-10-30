@@ -77,8 +77,17 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
+  if (which_dev == 2) {
+    if (!p->in_sighandler && p->interval && --p->interval_left == 0) {
+      p->interval_left = p->interval;
+      // Callee-saved (s0-s11) registers need not to be stored. 
+      p->sigreturn_trapframe = *(p->trapframe);
+      // Signal handler for process will be called when it's scheduled.
+      p->trapframe->epc = p->handler;
+      p->in_sighandler = 1;
+    }
     yield();
+  }
 
   usertrapret();
 }
